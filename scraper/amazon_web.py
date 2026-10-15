@@ -39,6 +39,9 @@ from .client import ScraperClient
 _DESKTOP_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
+# A widely-available product used as a probe page for auth checks.
+_SEED_ASIN = "B083TCZDMT"
+
 # Per-country marketplace: code -> (domain, marketplace id, accept-language).
 MARKETPLACES: dict[str, tuple[str, str, str]] = {
     "us": ("www.amazon.com",    "ATVPDKIKX0DER",  "en-US,en;q=0.9"),
@@ -436,6 +439,7 @@ class AmazonWebScraper:
         if template is None and self._cookie_header is None:
             raise ValueError("provide either template= or cookies=")
         self.client = client or ScraperClient(requests_per_second=1.0)
+        self.authenticated = False   # set True by authenticated() once verified
 
     @staticmethod
     def _as_cookie_header(cookies) -> str | None:
@@ -448,6 +452,44 @@ class AmazonWebScraper:
     @classmethod
     def from_cookies(cls, cookies, marketplace: str = "us", **kw) -> "AmazonWebScraper":
         return cls(cookies=cookies, marketplace=marketplace, **kw)
+
+    @classmethod
+    def authenticated(cls, cookies, marketplace: str = "us", *, rps: float = 1.0,
+                      verify: bool = True, client: "ScraperClient | None" = None
+                      ) -> "AmazonWebScraper":
+        """Build a scraper from a session **you logged into yourself**.
+
+        Pass cookies you exported from your own browser session (see
+        :mod:`scraper.auth`). Unlocks login-gated data such as full review text.
+        This library never logs in, handles your password, or solves sign-in
+        challenges — it only reuses the authenticated session you provide.
+
+        With ``verify`` (default), it fetches a page and confirms the session
+        really is signed in, raising :class:`AuthRequired` if not.
+        """
+        self = cls(cookies=cookies, marketplace=marketplace,
+                   client=client or ScraperClient(requests_per_second=rps))
+        if verify and not self.is_authenticated():
+            self.close()
+            raise AuthRequired("the provided cookies are not a signed-in session "
+                               "(log in in your browser, then re-export them)")
+        self.authenticated = True
+        return self
+
+    def is_authenticated(self) -> bool:
+        """Report whether this session is signed in.
+
+        Authoritative probe: request Your Orders, which Amazon serves only to a
+        signed-in user and otherwise redirects to `/ap/signin`.
+        """
+        try:
+            resp = self._get("/gp/css/order-history")
+        except BotWall:
+            return False
+        # The sign-in bounce can chain on (…/ap/signin → …/ax/claim), so inspect
+        # the whole redirect history, not just the final URL.
+        chain = [str(h.url) for h in resp.history] + [str(resp.url)]
+        return not any(("/ap/signin" in u or "/ap/claim" in u) for u in chain)
 
     @classmethod
     def open(cls, marketplace: str = "us", *, zip_code: str | None = None,
@@ -566,10 +608,11 @@ class AmazonWebScraper:
                                    "use review_summary() for anonymous aggregate data")
             rows = parse_reviews(resp.text)
             if not rows:
-                if page == start_page:
+                if page == start_page and not self.authenticated:
                     # Anonymous sessions get a page with no review text (lazy/gated).
                     raise AuthRequired(
-                        "no anonymous review text (login-gated); use review_summary()")
+                        "no anonymous review text (login-gated); use review_summary() "
+                        "or AmazonWebScraper.authenticated(cookies=…)")
                 break
             for r in rows:
                 r["asin"] = asin

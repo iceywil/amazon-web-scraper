@@ -218,8 +218,11 @@ What the HTML plane exposes to an anonymous session, now implemented in
 
 Two honest limits:
 - **Full review text is login-gated.** The aggregate/histogram is anonymous; the
-  per-review list redirects to sign-in. We don't log in, so `web-reviews` reports
-  `LOGIN REQUIRED` and `web-review-summary` is the anonymous substitute.
+  per-review list redirects to sign-in, so anonymously `web-reviews` reports
+  `LOGIN REQUIRED` and `web-review-summary` is the substitute. Full text is
+  available by supplying a session **you logged into yourself** — see
+  *Authenticated access* in §2 (`AmazonWebScraper.authenticated` /
+  `--auth-cookies`); the library never automates login.
 - **Prices follow egress geography.** Our egress geolocates to India, so
   `amazon.co.uk` returns prices in **INR**, not GBP — the number is correct, the
   currency is the visitor's. We therefore record `currency` on every price; true
@@ -289,6 +292,35 @@ run.py           convenience launcher for example.py
 Other ways to build a scraper (instead of `open()`): `AmazonWebScraper(cookies=…)`
 from a minted/saved session, or `AmazonWebScraper(template=load_curl_file(…))` to
 reuse a captured app or logged-in session.
+
+### Authenticated access (login-gated data, e.g. full review text)
+
+Anonymous sessions can't read `/product-reviews` — Amazon redirects them to
+sign-in. To read it you supply a session **you logged into yourself**; the library
+never handles your password, OTP, or the sign-in challenge, and does not automate
+login. You sign in with your own browser, export that session's cookies, and pass
+them in:
+
+```python
+from scraper import AmazonWebScraper, cookies_from_file
+
+cookies = cookies_from_file("amazon_cookies.txt")          # Netscape cookies.txt or JSON export
+with AmazonWebScraper.authenticated(cookies, "us") as amz:  # verifies you're signed in
+    for r in amz.reviews("B00G2XGC88", pages=2):
+        print(r["rating"], r["title"], r["author"], r["verified"])
+```
+
+`cookies_from_browser("chrome", "amazon.com")` can read them straight from your
+local browser instead (needs the `browser` extra: `pip install -e ".[browser]"`).
+`AmazonWebScraper.authenticated(...)` probes an account page and raises
+`AuthRequired` if the cookies aren't a signed-in session. The CLI mirrors this:
+
+```bash
+python -m scraper.cli web-reviews --auth-cookies amazon_cookies.txt --asin B00G2XGC88 --pages 2
+```
+
+Scope note: only *your own* session is used, reviewer names are kept as shown on
+each review, and reviewer profiles are never crawled.
 
 Design points worth noting:
 - **Resilience.** Transient `429/503/5xx` and connection errors are retried with

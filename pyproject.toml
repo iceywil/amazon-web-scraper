@@ -17,6 +17,10 @@ dependencies = [
     "cramjam>=2.8",
 ]
 
+[project.optional-dependencies]
+# Read cookies straight from your local browser (for authenticated sessions).
+browser = ["browser_cookie3>=0.19"]
+
 [project.urls]
 Homepage = "https://github.com/your-org/amazon-web-scraper"
 

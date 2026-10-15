@@ -58,6 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="a captured www.amazon.<tld> request (for its session cookies)")
     web.add_argument("--cookies", metavar="FILE",
                      help="a session JSON from 'mint-session' (alternative to --curl)")
+    web.add_argument("--auth-cookies", metavar="FILE", dest="auth_cookies",
+                     help="cookies.txt/JSON from a browser session YOU logged into "
+                          "(unlocks login-gated data like full review text)")
     web.add_argument("--zip", dest="zip_code", default="auto",
                      help="postal code for the headless session minted when neither "
                           "--cookies nor --curl is given (default: 10001 on us; 'none' "
@@ -166,8 +169,17 @@ def _run_mint(args: argparse.Namespace) -> int:
 
 
 def _web_scraper(args: argparse.Namespace, client: ScraperClient) -> AmazonWebScraper:
-    """Build a web scraper from --cookies (minted), --curl (captured), or, by
-    default, a session minted headlessly on the spot."""
+    """Build a web scraper from --auth-cookies (a session you logged into),
+    --cookies (minted), --curl (captured), or a session minted on the spot."""
+    if getattr(args, "auth_cookies", None):
+        from .auth import cookies_from_file
+        cookies = cookies_from_file(args.auth_cookies)
+        print(f"authenticated session from {args.auth_cookies}: {len(cookies)} cookies",
+              file=sys.stderr)
+        amz = AmazonWebScraper.authenticated(cookies, marketplace=args.marketplace,
+                                             client=client)
+        print("  verified: signed in", file=sys.stderr)
+        return amz
     if args.cookies:
         with open(args.cookies, encoding="utf-8") as fh:
             sess = json.load(fh)

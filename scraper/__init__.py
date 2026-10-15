@@ -43,6 +43,7 @@ from .amazon_web import (
     parse_seller,
     parse_seller_feedback,
 )
+from .auth import cookies_from_browser, cookies_from_file, is_signed_in
 from .capture import CapturedRequest, load_curl_file
 from .client import RateLimiter, ScraperClient
 from .metrics import Metrics
@@ -56,6 +57,10 @@ __all__ = [
     "mint_session",
     "bootstrap",
     "MARKETPLACES",
+    # authenticated access (session you created yourself)
+    "cookies_from_file",
+    "cookies_from_browser",
+    "is_signed_in",
     # parsers (operate on raw HTML you already have)
     "parse_search",
     "parse_product",
