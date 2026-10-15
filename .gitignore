@@ -1,0 +1,17 @@
+*.egg-info/
+*.pdf
+*.pyc
+.venv/
+__pycache__/
+android/cache/
+android/certs/
+android/emulator.log
+android/example_dp.curl
+android/example_request.curl
+android/example_suggestions.curl
+android/flows/
+android/mitmweb.log
+android/setup.log
+apk/
+out/
+session*.json

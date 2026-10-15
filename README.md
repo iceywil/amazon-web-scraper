@@ -1,0 +1,412 @@
+# Mobile-backend scraper — Amazon Shopping
+
+A reverse-engineering-style data collection tool built against the backend API of
+the **Amazon Shopping** mobile app. It intercepts the app's traffic, documents how
+the API works, and replays captured requests through a polite, resilient client.
+
+---
+
+## 1. Methodology (how the endpoints were found)
+
+The standard mobile-RE loop:
+
+1. **Intercept.** Run the app in an Android emulator routed through **mitmproxy**;
+   install the proxy CA certificate.
+2. **Defeat pinning** if traffic doesn't appear: attach **Frida** / **objection**
+   to bypass certificate pinning.
+3. **Observe.** Use the app normally; watch each screen produce requests and read
+   off the URLs, query params, headers, and pagination scheme.
+4. **Confirm statically** with **jadx** / **apktool** on the APK to understand how
+   requests are built (base URLs, any signing/HMAC, token lifecycle).
+5. **Replay** one request with `curl` outside the app, then generalise into code.
+
+### Reproducing the loop against the Amazon app (`android/`)
+
+The `android/` folder automates the discovery half on a local, rooted emulator —
+scripted end to end and verified against **Amazon Shopping 32.18.0.100**:
+
+```bash
+android/setup_emulator.sh    # SDK + a rootable Android 15 (API 35) arm64 AVD
+android/start_emulator.sh    # boot it with a writable system partition, as root
+android/install_xapk.sh apk/amazon-shopping-32.18.0.100.xapk  # verify signer, install
+android/install_ca.sh        # trust the mitmproxy CA system-wide (Conscrypt APEX overlay)
+android/start_frida.sh       # push + run the matching frida-server
+android/capture.sh           # proxy -> mitmweb, launch Amazon with cert-unpinning
+```
+
+`install_ca.sh` handles the Android 14+ change where the CA store moved into the
+read-only Conscrypt APEX: it overlays a tmpfs copy into **init's** mount namespace
+so every app inherits it. `unpin.js` neutralises the extra pinning layers
+(OkHttp `CertificatePinner`, `TrustManagerImpl`, custom `X509TrustManager`s).
+
+### What a live capture revealed
+
+The scripts above were run for real: a 300 s session (`android/_capture_session.sh`)
+attached Frida's unpinning to Amazon, drove the app across the home feed, the
+search box (typeahead + results) and product deep-links, and recorded every flow.
+`android/analyze_flows.py` then mined the `.mitm` file. The notes below are the
+honest result — reproduce them with the commands shown.
+
+#### Finding 1 — the app is a **hybrid**, not a pure native client
+
+Traffic splits into two cleanly separated planes:
+
+| Plane | Host(s) | Auth | Body | What it carries |
+|-------|---------|------|------|-----------------|
+| **Native "AAPI" shell** | `data.amazon.com` | `x-aapi-signature` HMAC + `x-amzn-session-id` | Snappy, `multipart/vnd.com.amazon.api+json` | nav trees, tabs, chrome, store modes |
+| **Web storefront (in WebView)** | `www.amazon.com` | **cookies** (`session-id`, `sst-main`, `lc-main`) | gzip HTML **or** JSON | search, suggestions, product, cart, location |
+
+The give-away: every `www.amazon.com` request carries Chromium `sec-ch-ua*`
+client-hint headers, `x-requested-with: XMLHttpRequest` (XHR) or
+`x-requested-with: com.amazon.mShop.android.shopping` (top-level nav), and a
+WebView `user-agent`. The native shell boots the chrome via the signed AAPI, then
+renders the actual shopping screens as web pages inside WebViews. **The
+scrapable product data lives on the web plane, behind a cookie — not behind the
+HMAC.**
+
+#### Finding 2 — the two authentication models
+
+- **AAPI (native):** `x-aapi-signature: HmacSHA256 Time=<ts> SignedHeaders=<list> Signature=<hex>/<hex>`.
+  The signature covers a fixed header set and is **time-bound**, so it cannot be
+  forged or replayed outside its window. A captured AAPI request replayed later
+  returns `401/400` — which is the honest, expected result, and the reason the
+  scraper is built to *replay* rather than *synthesise*.
+- **Web (WebView):** ordinary Amazon session cookies. These are long-lived, so a
+  captured web request **replays successfully** (demonstrated below).
+
+#### Finding 3 — the search endpoints
+
+| Endpoint | Returns | Notes |
+|----------|---------|-------|
+| `GET www.amazon.com/suggestions?prefix=<q>&...` | **JSON** `{suggestions:[…]}` | typeahead; one call per keystroke; cleanest to collect |
+| `GET www.amazon.com/s?k=<q>&page=<n>` | **HTML** (~800 KB) | the results page; parse product cards, paginate with `&page=` |
+| `GET www.amazon.com/autocomplete` | HTML | the search overlay host page |
+
+`/suggestions` is the easy win: structured JSON, cookie-auth, `records-path
+suggestions`. `/s` is server-rendered HTML — scraping it means parsing the DOM
+(or finding its JSON data-island), not reading a clean API.
+
+#### Finding 3b — parsing `/s` and `/dp` (built + working)
+
+Both the search-results and product-detail pages were reverse-engineered and are
+implemented in [`scraper/amazon_web.py`](scraper/amazon_web.py):
+
+- **`/s` search results.** Each product is a
+  `div[data-component-type="s-search-result"]` carrying `data-asin`; inside it,
+  the title is in `h2`, the price in `.a-price .a-offscreen`, the star rating in
+  `.a-icon-alt` ("4.5 out of 5 stars"), the thumbnail in `img.s-image`, and
+  sponsored cards are flagged by the `AdHolder` class. Pagination is `&page=N`
+  (verified: consecutive pages return disjoint ASIN sets).
+- **`/dp` product detail.** *The layout depends on the `User-Agent`.* Under the
+  app's own UA, `/dp` returns an app-optimised page whose field ids are unstable;
+  under a **desktop UA** it returns the classic layout with dependable ids —
+  `#productTitle`, `#corePrice_feature_div .a-offscreen`, `#acrPopover[title]`
+  (rating), `#acrCustomerReviewText` (review count), `#feature-bullets li`,
+  `#availability`. So `product()` sends a desktop UA by default (keeping the
+  captured cookies) and the parser falls back across selectors + regex.
+- **Request shaping matters.** If the captured template is the `/suggestions`
+  **XHR** (`accept: application/json`, `x-requested-with: XMLHttpRequest`), those
+  headers make `/s` and `/dp` return partial/JSON fragments. The scraper rewrites
+  them into a top-level **document navigation** so full HTML comes back.
+
+Verified live, reusing a captured cookie with no account signed in:
+
+```
+web-search "coffee mug"  -> 14 cards (asin/title/price/rating/reviews/image/sponsored)
+web-product B083TCZDMT    -> Contigo … $17.58 ★4.5 45,102 reviews, In Stock, 5 bullets
+```
+
+#### Finding 4 — environment quirks worth recording
+
+- **Geo-routing.** The emulator egressed from an IP that Amazon geolocated to
+  **Indonesia** ("We're showing you items that ship to Indonesia"), so US-marketplace
+  (`ATVPDKIKX0DER`) product/search deep-links returned the app's "UH-OH" error page
+  (`CS3`). The in-app search box still worked. On a real target, egress geography
+  changes what you can collect — note it.
+- **Snappy.** Native AAPI responses use `accept-encoding: snappy`; mitmproxy can't
+  decode it, so `analyze_flows.py` falls back to `cramjam` to recover JSON.
+- **Telemetry fan-out.** Alongside the useful endpoints sit `maes/v2`,
+  `fls-na.amazon.com`, `unagi*.amazon.com`, `bitdrift`, a `mdcs` WebSocket
+  (HTTP `101`) and Arcus remote-config — all skippable for data collection.
+
+#### Finding 5 — a working replay against a live endpoint
+
+The cookie-authed typeahead replays end to end and returns live data:
+
+```bash
+# one-off: export a captured request, then collect live suggestions as NDJSON
+python run.py replay --curl android/example_suggestions.curl \
+    --records-path suggestions --pages 1 --format ndjson
+# -> {"type":"PAST_SEARCHES","value":"…"}  {"type":"KEYWORD","value":"… maker"} …
+```
+
+This closes the chain the project set out to demonstrate: **intercept → unpin →
+decrypt → export cURL → replay through the scraper → structured records**, on a
+real Amazon endpoint.
+
+#### Finding 6 — you don't actually need the emulator (or a browser)
+
+The emulator was how we *discovered* and *captured* the protocol. For ongoing
+collection on the web plane, it turns out not to be needed at all — and neither is
+a headless browser. Two facts, both verified:
+
+- **The storefront cookies are not a credential.** They are the anonymous session
+  Amazon hands any first visitor; the captured app cookies worked only because
+  they were such a session, not because the app authenticated them.
+- **`/dp` and `/s` mint a session for a plain client.** A scripted `GET /`
+  (homepage) is answered by CloudFront with an **HTTP 202 AWS WAF JavaScript
+  challenge** (a 2 KB page carrying `window.gokuProps`) and at most `ak_bmsc` —
+  no `session-id`. But a plain `GET /dp/<ASIN>` (or `/s`) is answered directly and
+  **sets the full session** (`session-id`, `sst-main`, `i18n-prefs`, …). So
+  [`scraper/session.py`](scraper/session.py) mints a usable session over plain
+  HTTP in one request, then (optionally) pins the delivery location through
+  Amazon's two-hop glow CSRF flow (`anti-csrftoken-a2z` → `address-change`).
+
+```bash
+python run.py mint-session --marketplace us --zip 10001 -o session.json
+#   seeded (us): ['i18n-prefs','lc-main','session-id','session-id-time','sp-cdn','sst-main']
+#   delivery location set to 10001
+```
+
+What the headless bootstrap showed, step by step (plain `httpx`, HTTP/2,
+desktop Chrome UA, from a non-US egress IP):
+
+| Request | Result |
+|---------|--------|
+| `GET /` | `202`, AWS WAF JS challenge, no session cookie |
+| `GET /s?k=…` with **no cookies at all** | `200`, 48 product cards — even a cookie is optional for reads |
+| `GET /dp/<ASIN>` | `200`, full page + `Set-Cookie`: `session-id`, `session-id-time`, `sst-main`, `i18n-prefs`, `lc-main`, `sp-cdn` |
+| …same session, prices | geolocated from the egress IP: `i18n-prefs=INR`, `sp-cdn="L5Z9:IN"`, "Deliver to **India**", price `1667.85` (INR) |
+| `GET /portal-migration/hz/glow/get-rendered-address-selections` + header `anti-csrftoken-a2z` (from the `/dp` page's `nav-global-location-data-modal-action` `data-a-modal` JSON) | `200`, location modal HTML carrying a second `CSRF_TOKEN` |
+| `POST /portal-migration/hz/glow/address-change?actionSource=glow` + that token, body `{"locationType":"LOCATION_INPUT","zipCode":"10001",…}` | `{"isAddressUpdated":1,"address":{"countryCode":"US","city":"NEW YORK",…}}`; adds `ubid-main`, `session-token` |
+| `GET /dp/<ASIN>` again | "Deliver to **New York 10001**", **$17.58 USD**, In Stock |
+
+Two takeaways:
+- **The geo-IP silently changes the data.** Without a location, amazon.com
+  serves INR prices and India availability, which is still a valid `200` page.
+  So pin a ZIP code, or at least force the currency: setting the
+  `i18n-prefs=<currency>` cookie alone brings back USD (or GBP, EUR, … per
+  store). The ZIP code also fixes availability and delivery estimates.
+- **A seed page must not be the homepage.** Any `/dp/<ASIN>` works; the ASIN
+  can be overridden with `--seed-asin` if it is ever delisted.
+
+**This is now the default.** Every `web-*` command run without `--cookies` or
+`--curl` mints a session itself (ZIP `10001` on `us`; on other stores the
+IP-geolocated location, with the store's own currency forced). `mint-session`
+is still there to save a session to a file and reuse it across runs.
+
+So: **the emulator is for capture/analysis; routine web collection needs only a
+minted session.** The native AAPI plane still needs the app (its HMAC can't be
+reproduced off-device). On *not getting bot-walled*: the durable approach is to
+behave like a legitimate client — hit the pages that answer plainly, keep the
+session, and rate-limit — not to forge fingerprints or solve challenges at scale.
+
+#### Finding 7 — endpoint coverage and limits
+
+What the HTML plane exposes to an anonymous session, now implemented in
+[`scraper/amazon_web.py`](scraper/amazon_web.py):
+
+| Data | Endpoint | Anonymous? | Parser |
+|------|----------|-----------|--------|
+| Search results | `/s?k=&page=` | ✅ | `parse_search` (asin, title, price+currency, rating, reviews, image, sponsored) |
+| Category listing | `/s?rh=n:<node>&fs=true` | ✅ | `parse_search` (`fs=true` forces the grid; a bare node is a landing page) |
+| Product detail | `/dp/<ASIN>` | ✅ | `parse_product` (+ brand, availability, bullets, seller, seller_id) |
+| **Review aggregate** | `/dp` `#reviewsMedley` | ✅ | `parse_review_summary` (average, total, per-star histogram) |
+| Individual review *text* | `/product-reviews/<ASIN>` | ❌ **login** | redirects to `/ap/signin` → `AuthRequired` |
+| Seller ("company") | `/sp?seller=<ID>` | ✅ | `parse_seller` (name, rating, business info) |
+| Seller feedback | `/sp?seller=<ID>` | ✅ | `parse_seller_feedback` (rating, comment, rater name, date) |
+
+Two honest limits:
+- **Full review text is login-gated.** The aggregate/histogram is anonymous; the
+  per-review list redirects to sign-in. We don't log in, so `web-reviews` reports
+  `LOGIN REQUIRED` and `web-review-summary` is the anonymous substitute.
+- **Prices follow egress geography.** Our egress geolocates to India, so
+  `amazon.co.uk` returns prices in **INR**, not GBP — the number is correct, the
+  currency is the visitor's. We therefore record `currency` on every price; true
+  local pricing needs in-country egress.
+- **Reviewer/feedback author** names are captured *as shown on the entry*; we do
+  not crawl individual reviewer profiles.
+
+#### Mining a capture yourself
+
+```bash
+python android/analyze_flows.py android/flows/session.mitm                 # endpoint table
+python android/analyze_flows.py android/flows/session.mitm --host www.amazon.com
+python android/analyze_flows.py android/flows/session.mitm --grep /suggestions --show 1
+```
+
+> Everything here runs on your own emulator against an anonymous (skip-sign-in)
+> session, to *document* the protocol. It defeats no protection on anyone else's
+> device and collects no account data. Captured flows and any exported cURL files
+> hold session cookies/tokens, so they are git-ignored — keep them that way.
+
+---
+
+## 2. The library
+
+The collector is a small importable library. One class, `AmazonWebScraper`, mints
+an anonymous session and exposes a method per surface:
+
+```python
+from scraper import AmazonWebScraper
+
+with AmazonWebScraper.open("us", zip_code="10001") as amz:   # mints a session, no emulator
+    for card in amz.search("coffee grinder", pages=1):       # -> dict rows
+        print(card["asin"], card["price"], card["currency"], card["title"])
+    detail  = amz.product(card["asin"])                      # -> dict
+    ratings = amz.review_summary(card["asin"])               # average + star histogram
+    seller  = amz.seller(detail["seller_id"])                # a seller ("company") page
+```
+
+Public API (`from scraper import …`):
+
+| Method / function | Returns | Surface |
+|---|---|---|
+| `AmazonWebScraper.open(marketplace, zip_code=…)` | ready scraper | mints a session |
+| `.search(keyword, pages=…)` | iter of dict | `/s` product cards |
+| `.browse(node, pages=…)` | iter of dict | `/s?rh=n:` category |
+| `.product(asin)` | dict | `/dp` detail |
+| `.review_summary(asin)` | dict | `/dp` rating + histogram |
+| `.reviews(asin, pages=…)` | iter of dict | `/product-reviews` (login-gated → `AuthRequired`) |
+| `.seller(seller_id)` | dict | `/sp` seller page |
+| `.seller_feedback(seller_id, pages=…)` | iter of dict | `/sp` feedback entries |
+| `mint_session(marketplace, zip_code=…)` | session dict | raw session cookies |
+| `parse_search / parse_product / parse_review_summary / parse_seller / …` | records | parse HTML you already have |
+
+```
+scraper/
+  __init__.py    the public API above
+  client.py      HTTP/2 session · UA · rate limiter · retry/backoff · cookie jar
+  session.py     mints an anonymous web session over HTTP (no emulator/browser)
+  amazon_web.py  AmazonWebScraper + parsers · 12 marketplaces · currency-aware
+  capture.py     parses a "Copy as cURL" request into a replayable form
+  amazon.py      replay path for JSON endpoints (native AAPI, /suggestions)
+  cli.py         optional thin CLI over the library (python -m scraper.cli)
+example.py       runnable demo that prints a résumé of each method's output
+run.py           convenience launcher for example.py
+```
+
+Other ways to build a scraper (instead of `open()`): `AmazonWebScraper(cookies=…)`
+from a minted/saved session, or `AmazonWebScraper(template=load_curl_file(…))` to
+reuse a captured app or logged-in session.
+
+Design points worth noting:
+- **Resilience.** Transient `429/503/5xx` and connection errors are retried with
+  exponential backoff; non-retryable `4xx` fails fast.
+- **Politeness.** A thread-safe rate limiter caps the request rate.
+- **Honesty.** A captcha/login wall raises `BotWall` / `AuthRequired` instead of
+  silently returning garbage.
+- **Currency-aware.** Every price carries a `currency`, so geolocated pricing
+  (§1, Finding 7) is explicit rather than silently wrong.
+
+---
+
+## 3. Install & run
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .            # installs the library + its deps (or: pip install -r requirements.txt)
+```
+
+**Run the demo** — mints a session and prints a résumé of each method's output:
+
+```bash
+python example.py          # US marketplace
+python example.py uk       # any of: us uk de fr it es ca jp in mx br au
+```
+
+**Use it as a library:**
+
+```python
+from scraper import AmazonWebScraper
+
+with AmazonWebScraper.open("us", zip_code="10001") as amz:
+    cards = list(amz.search("coffee grinder", pages=2))
+    print(len(cards), "results;", cards[0]["asin"], cards[0]["price"], cards[0]["currency"])
+
+    product = amz.product(cards[0]["asin"])
+    print(product["title"], product["rating"], product["reviews"])
+
+    summary = amz.review_summary(cards[0]["asin"])      # anonymous aggregate
+    print(summary["average"], summary["histogram"])
+
+    if product["seller_id"]:
+        print(amz.seller(product["seller_id"])["name"])
+        for fb in amz.seller_feedback(product["seller_id"], pages=1):
+            print(fb["rating"], fb["rated_by"], fb["comment"])
+```
+
+Parse HTML you already have, without any network:
+
+```python
+from scraper import parse_search, parse_product
+rows = parse_search(open("some_search.html").read())
+```
+
+**Optional CLI** (a thin wrapper over the same library):
+
+```bash
+python -m scraper.cli web-search --keyword "coffee mug" --pages 2 --format ndjson
+python -m scraper.cli web-product --marketplace uk --asin B0D1VN9691
+```
+
+### Politeness, metrics & benchmarking
+
+Every `ScraperClient` is rate-limited and self-instrumenting:
+
+- **Rate limiting** — a thread-safe limiter spaces requests at `requests_per_second`,
+  with optional `jitter` so the cadence isn't machine-perfect.
+- **Adaptive backoff** — a `429`/`503` widens the interval (`penalise`), and clean
+  responses decay it back (`relax`); transient `429/500/502/503/504` and transport
+  errors retry with exponential backoff.
+- **Metrics** — `client.metrics` tracks requests, status mix, retries, throttles,
+  rate-limit wait time and latency:
+
+  ```python
+  with AmazonWebScraper.open("us") as amz:
+      list(amz.search("coffee", pages=1))
+      print(amz.client.metrics.pretty())
+      # requests=3 status={200: 3} retries=0 throttled=0 errors=0
+      # elapsed=6.2s effective=0.48/s latency avg/min/max=1980/1511/2752ms
+  ```
+
+[`benchmark.py`](benchmark.py) verifies this behaviour **without load-testing
+Amazon**: it checks the rate limiter's spacing and the adaptive backoff *offline*
+(no network), and `--live N` measures latency/metrics over a **small, capped,
+rate-limited** burst of real requests.
+
+```bash
+python benchmark.py            # offline checks only
+python benchmark.py --live 8   # + a gentle, capped real-request sample
+```
+
+> We deliberately do **not** stress-test Amazon's own rate limits — deliberately
+> probing a third party's anti-abuse thresholds at volume is abusive and against
+> their ToS. The tooling here is for keeping *our* client polite and observable.
+
+---
+
+## 4. Ethics & scope
+
+- **Anonymous, read-only.** Collection uses an anonymous guest session (minted or
+  captured) and reads public catalogue pages. No account is logged in; no private
+  or account data is touched. Full review *text*, which is login-gated, is left
+  alone (`AuthRequired`).
+- **No detection-evasion.** We pass the bot wall the legitimate way — by requesting
+  the pages that answer a plain client and keeping the session — and rate-limit
+  politely. We do **not** forge TLS/browser fingerprints, solve CAPTCHAs, or rotate
+  identities to hide scale.
+- **People.** Reviewer / feedback author names are recorded only as shown on the
+  entry; reviewer profiles are not crawled or compiled.
+- **Your responsibility.** Scraping may conflict with Amazon's Terms of Service and
+  local law; prefer the official PA-API / SP-API where they cover your need, and
+  respect each target's ToS and robots directives before collecting.
+
+---
+
+## 5. Adapting to another target
+
+1. Capture the target's requests (Methodology, §1).
+2. Set the base URL + captured headers/token in `ScraperClient`.
+3. Write a new adapter beside `amazon.py` mapping its endpoints to methods.
+4. Reuse `client.py`, `capture.py`, and `cli.py` unchanged.

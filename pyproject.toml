@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "amazon-web-scraper"
+version = "0.1.0"
+description = "Mint an anonymous Amazon web session over HTTP and parse search, product, review, and seller pages for any marketplace."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["amazon", "scraper", "ecommerce", "reverse-engineering"]
+dependencies = [
+    "httpx[http2]>=0.27",
+    "tenacity>=9.0",
+    "beautifulsoup4>=4.12",
+    "cramjam>=2.8",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/amazon-web-scraper"
+
+[tool.setuptools]
+packages = ["scraper"]
