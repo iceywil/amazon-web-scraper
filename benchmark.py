@@ -14,9 +14,12 @@ load-test infrastructure we don't own. Instead it measures our own behaviour:
 from __future__ import annotations
 
 import argparse
+import threading
 import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from scraper import AmazonWebScraper, RateLimiter
+from scraper import AmazonWebScraper, RateLimiter, ScraperClient
 
 LIVE_CAP = 20          # hard ceiling: this is a politeness demo, not a stress test
 LIVE_RPS = 1.0         # gentle
@@ -56,6 +59,102 @@ def check_adaptive() -> None:
     print(f"after 5 clean replies: {rl.min_interval:.2f}s (decaying toward base)")
 
 
+# --- local mock server: a stand-in for a rate-limited backend ----------------
+class _RateGate:
+    """Allows up to `limit` requests per rolling 1s window; else the caller 429s."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._hits: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def allow(self) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            while self._hits and now - self._hits[0] > 1.0:
+                self._hits.popleft()
+            if len(self._hits) >= self.limit:
+                return False
+            self._hits.append(now)
+            return True
+
+
+def _make_handler(gate: _RateGate):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):              # noqa: N802
+            if gate.allow():
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+            else:                      # over the limit -> throttle, like Amazon
+                self.send_response(429)
+                self.send_header("retry-after", "1")
+                self.end_headers()
+                self.wfile.write(b"throttled")
+
+        def log_message(self, *a):     # silence the default stderr logging
+            pass
+    return Handler
+
+
+class _MockBackend:
+    """A localhost server that throttles above `limit` req/s — our safe 'edge'."""
+
+    def __init__(self, limit: int) -> None:
+        self.gate = _RateGate(limit)
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(self.gate))
+        self.port = self.httpd.server_address[1]
+        self._t = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/"
+
+    def __enter__(self):
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.httpd.shutdown()
+
+
+def ramp_against_mock(limit: int, rates, per_rate: int, adaptive: bool) -> None:
+    """Ramp request rate against a local mock whose edge is `limit` req/s.
+
+    Shows throughput climb, flatten at the edge, and (with adaptive) how the
+    client backs off to avoid the wall — all without touching any real service.
+    """
+    mode = "adaptive backoff ON" if adaptive else "adaptive OFF (raw edge)"
+    bar(f"RAMP vs local mock — edge = {limit} req/s  [{mode}]")
+    print("Escalating the request rate against OUR OWN server (localhost); the "
+          "mock\nreturns 429 past its limit — this is where we 'see the edge'.\n")
+    print(f"{'target rps':>10} | {'sent':>5} | {'200':>4} | {'429':>4} | "
+          f"{'ok rps':>7} | {'retries':>7}")
+    with _MockBackend(limit) as mock:
+        for rps in rates:
+            c = ScraperClient(requests_per_second=rps, adaptive=adaptive,
+                              max_attempts=4, timeout=5.0)
+            try:
+                for _ in range(per_rate):
+                    try:
+                        c.fetch("GET", mock.url)
+                    except Exception:
+                        pass
+                m = c.metrics
+                ok = m.by_status.get(200, 0)
+                th = m.by_status.get(429, 0)
+                ok_rps = ok / m.elapsed if m.elapsed else 0.0
+                print(f"{rps:>10.0f} | {m.requests:>5} | {ok:>4} | {th:>4} | "
+                      f"{ok_rps:>7.1f} | {m.retries:>7}")
+            finally:
+                c.close()
+    note = ("adaptive ON widens the interval after each 429, so repeat hits taper off"
+            if adaptive else
+            "adaptive OFF keeps firing at the target rate, so 429s recur")
+    print(f"\nRead the edge: successful throughput plateaus around {limit}/s; past that "
+          f"the\nmock returns 429 and the client retries with backoff. {note}.")
+
+
 def check_live(n: int, marketplace: str) -> None:
     """C: metrics over a small, polite burst of real requests."""
     n = min(n, LIVE_CAP)
@@ -80,6 +179,10 @@ def check_live(n: int, marketplace: str) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--ramp", action="store_true",
+                    help="ramp the rate against a LOCAL mock to find the edge (safe)")
+    ap.add_argument("--edge", type=int, default=10, metavar="RPS",
+                    help="the mock's throttle limit for --ramp (default 10/s)")
     ap.add_argument("--live", type=int, metavar="N", default=0,
                     help=f"also run N real requests (polite, capped at {LIVE_CAP})")
     ap.add_argument("--marketplace", default="us")
@@ -87,10 +190,15 @@ def main() -> int:
 
     check_rate_limiter()
     check_adaptive()
+    if args.ramp:
+        rates = [r for r in (2, 5, 10, 20, 40) if r <= args.edge * 5]
+        ramp_against_mock(args.edge, rates, per_rate=40, adaptive=False)
+        ramp_against_mock(args.edge, rates, per_rate=40, adaptive=True)
     if args.live > 0:
         check_live(args.live, args.marketplace)
-    else:
-        print("\n(offline checks only — pass --live N to measure real-request metrics)")
+    if not args.ramp and not args.live:
+        print("\n(offline checks only — pass --ramp to find the edge against a local "
+              "mock,\n or --live N to measure real-request metrics)")
     return 0
 
 

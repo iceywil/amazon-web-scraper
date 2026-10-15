@@ -376,13 +376,29 @@ Amazon**: it checks the rate limiter's spacing and the adaptive backoff *offline
 rate-limited** burst of real requests.
 
 ```bash
-python benchmark.py            # offline checks only
-python benchmark.py --live 8   # + a gentle, capped real-request sample
+python benchmark.py                 # offline checks only
+python benchmark.py --ramp          # ramp the rate against a LOCAL mock to find the edge
+python benchmark.py --ramp --edge 25   # mock throttles above 25 req/s
+python benchmark.py --live 8        # + a gentle, capped real-request sample
 ```
 
-> We deliberately do **not** stress-test Amazon's own rate limits — deliberately
+`--ramp` answers "how does the client behave as we push the rate up to the edge?"
+*safely*: it starts a localhost server that returns `429` above a configurable
+limit, then escalates the request rate against **that** and shows throughput climb,
+plateau at the edge, and the retry/backoff response — e.g.:
+
+```
+target rps | sent | 200 | 429 | ok rps | retries
+         2 |   40 |  40 |   0 |    2.0 |       0
+         5 |   40 |  40 |   0 |    5.0 |       0
+        10 |   41 |  40 |   1 |    7.9 |       1     <- edge
+        20 |   44 |  40 |   4 |    6.5 |       4
+```
+
+> We deliberately do **not** push escalating load at Amazon to find *their* limit —
 > probing a third party's anti-abuse thresholds at volume is abusive and against
-> their ToS. The tooling here is for keeping *our* client polite and observable.
+> their ToS. `--ramp` finds the edge of a mock we own; the rest keeps *our* client
+> polite and observable.
 
 ---
 
