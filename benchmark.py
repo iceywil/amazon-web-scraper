@@ -183,6 +183,10 @@ def main() -> int:
                     help="ramp the rate against a LOCAL mock to find the edge (safe)")
     ap.add_argument("--edge", type=int, default=10, metavar="RPS",
                     help="the mock's throttle limit for --ramp (default 10/s)")
+    ap.add_argument("--fine", action="store_true",
+                    help="ramp in 1-rps steps (precise) instead of coarse jumps")
+    ap.add_argument("--requests", type=int, default=40, metavar="N",
+                    help="requests per rate step (more = tighter estimate; default 40)")
     ap.add_argument("--live", type=int, metavar="N", default=0,
                     help=f"also run N real requests (polite, capped at {LIVE_CAP})")
     ap.add_argument("--marketplace", default="us")
@@ -191,9 +195,13 @@ def main() -> int:
     check_rate_limiter()
     check_adaptive()
     if args.ramp:
-        rates = [r for r in (2, 5, 10, 20, 40) if r <= args.edge * 5]
-        ramp_against_mock(args.edge, rates, per_rate=40, adaptive=False)
-        ramp_against_mock(args.edge, rates, per_rate=40, adaptive=True)
+        if args.fine:                       # 1-rps steps spanning the edge
+            lo = max(1, args.edge - 6)
+            rates = list(range(lo, args.edge + 7))
+        else:
+            rates = [r for r in (2, 5, 10, 20, 40) if r <= args.edge * 5]
+        ramp_against_mock(args.edge, rates, per_rate=args.requests, adaptive=False)
+        ramp_against_mock(args.edge, rates, per_rate=args.requests, adaptive=True)
     if args.live > 0:
         check_live(args.live, args.marketplace)
     if not args.ramp and not args.live:
