@@ -21,6 +21,16 @@ from .capture import load_curl_file
 from .client import ScraperClient
 
 
+def _pages(value: str) -> int | None:
+    """--pages N, or --pages all (None: paginate until the listing ends)."""
+    if value.lower() == "all":
+        return None
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("--pages must be >= 1 or 'all'")
+    return n
+
+
 def build_parser() -> argparse.ArgumentParser:
     # Shared options, attached to both the top parser and every subparser so they
     # may appear before OR after the subcommand name.
@@ -67,7 +77,8 @@ def build_parser() -> argparse.ArgumentParser:
                           "keeps the IP-geolocated store)")
     web.add_argument("--marketplace", default="us",
                      help="country marketplace: us, uk, de, fr, it, es, ca, jp, in, mx, br, au")
-    web.add_argument("--pages", type=int, default=1)
+    web.add_argument("--pages", type=_pages, default=1,
+                     help="pages to fetch, or 'all' to follow the listing to its end")
     web.add_argument("--start-page", type=int, default=1)
     web.add_argument("--rps-replay", type=float, default=1.0, dest="rps_replay",
                      help="request rate (default 1/s; keep it gentle)")
@@ -92,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="individual reviews from /product-reviews/<ASIN> (login-gated)")
     wr.add_argument("--asin", required=True, help="product ASIN")
 
+    wpf = sub.add_parser("web-profile", parents=[common, web],
+                         help="fetch reviewers' public profiles /gp/profile/<amzn1.account.…>")
+    wpf.add_argument("--profile", nargs="+", required=True,
+                     help="profile id(s) or URL(s), e.g. a review's author_profile")
+
     wse = sub.add_parser("web-seller", parents=[common, web],
                          help="fetch a seller ('company') page /sp?seller=<ID>")
     wse.add_argument("--seller", required=True, help="seller id")
@@ -110,6 +126,18 @@ def build_parser() -> argparse.ArgumentParser:
     ms.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS)
     ms.add_argument("-o", "--out", default="session.json", dest="session_out",
                     help="where to write the session JSON (default session.json)")
+
+    # Sign in yourself on the emulator while the sign-in/sign-up flow is recorded.
+    lg = sub.add_parser("login",
+                        help="open sign-in on the emulator, capture the flow, save the session")
+    lg.add_argument("--marketplace", default="us")
+    lg.add_argument("--app", action="store_true",
+                    help="use the Amazon app (Frida-unpinned) instead of the emulator browser")
+    lg.add_argument("--timeout", type=float, default=600, help="seconds to wait (default 600)")
+    lg.add_argument("--out-dir", default=None, help="capture directory (default android/flows)")
+    lg.add_argument("--no-verify", dest="verify", action="store_false",
+                    help="skip the signed-in probe against Your Orders")
+    lg.add_argument("-v", "--verbose", action="store_true", default=argparse.SUPPRESS)
     return p
 
 
@@ -129,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_replay(args)
     if args.command == "mint-session":
         return _run_mint(args)
+    if args.command == "login":
+        return _run_login(args)
     if args.command.startswith("web-"):
         return _run_web(args)
     return 2  # pragma: no cover
@@ -165,6 +195,22 @@ def _run_mint(args: argparse.Namespace) -> int:
         json.dump(sess, fh, indent=2)
     print(f"session for {sess['marketplace']} ({sess['domain']}): "
           f"{len(sess['cookies'])} cookies -> {args.session_out}", file=sys.stderr)
+    return 0
+
+
+def _run_login(args: argparse.Namespace) -> int:
+    from .auth import login_in_browser
+    try:
+        cookies = login_in_browser(args.marketplace, app=args.app, timeout=args.timeout,
+                                   out_dir=args.out_dir, verify=args.verify)
+    except AuthRequired as exc:
+        print(f"NOT SIGNED IN: {exc}", file=sys.stderr)
+        return 4
+    except RuntimeError as exc:
+        print(f"login failed: {exc}", file=sys.stderr)
+        return 3
+    print(f"signed in: {len(cookies)} cookies — reuse with "
+          f"--auth-cookies {args.out_dir or 'android/flows'}/login_cookies.json", file=sys.stderr)
     return 0
 
 
@@ -224,6 +270,8 @@ def _run_web(args: argparse.Namespace) -> int:
                 it = (s.review_summary(a) for a in args.asin)
             elif args.command == "web-reviews":
                 it = s.reviews(args.asin, pages=args.pages, start_page=args.start_page)
+            elif args.command == "web-profile":
+                it = (s.profile(p) for p in args.profile)
             elif args.command == "web-seller":
                 it = iter([s.seller(args.seller)])
             elif args.command == "web-seller-feedback":

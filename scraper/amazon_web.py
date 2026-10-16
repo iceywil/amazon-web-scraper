@@ -21,20 +21,24 @@ and point it at any marketplace (`marketplace="uk"`, `"de"`, `"jp"`, …):
 What the HTML gives us, per page (learned from live captures):
   * `/s`      product cards: `div[data-component-type="s-search-result"]`.
   * `/dp`     detail: desktop UA yields stable ids (`#productTitle`, `#corePrice…`).
-  * `/product-reviews/<ASIN>`  review blocks: `div[data-hook="review"]`.
+  * `/product-reviews/<ASIN>`  review blocks: `[data-hook="review"]` (an `<li>`).
   * `/sp?seller=<ID>`          seller name, feedback summary, business info.
 """
 from __future__ import annotations
 
+import html as _html
 import json
+import logging
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from bs4 import BeautifulSoup
 
 from .capture import CapturedRequest
 from .client import ScraperClient
+
+log = logging.getLogger(__name__)
 
 _DESKTOP_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -331,13 +335,56 @@ def parse_review_summary(html: str) -> dict[str, Any]:
     }
 
 
-def parse_reviews(html: str) -> list[dict[str, Any]]:
+# Amazon image URLs carry a resize directive before the extension
+# (".../I/714zIXoRKlL._SY88.jpg"); dropping it yields the original upload.
+_IMG_SIZE = re.compile(r"\._[^/]*?(\.\w+)$")
+
+
+def _full_size(url: str) -> str:
+    return _IMG_SIZE.sub(r"\1", url)
+
+
+def _is_default_avatar(url: str) -> bool:
+    # The silhouette is ".../amazon-avatars-global/default.png", or a resized
+    # "default._CR0,0,1024,1024_SX48_.png" on some stores.
+    return url.rsplit("/", 1)[-1].startswith("default")
+
+
+def _abs_profile(a, base: str) -> str | None:
+    href = a.get("href") if a else None
+    if not href:
+        return None
+    href = re.split(r"[/?]ref=", href)[0]
+    return href if href.startswith("http") else base + href
+
+
+def _avatar(rev) -> str | None:
+    """The reviewer's avatar as shown on the card; None for the default silhouette."""
+    img = rev.select_one(".a-profile-avatar img")
+    src = (img.get("data-src") or img.get("src")) if img else None
+    if not src or _is_default_avatar(src) or "grey-pixel" in src:
+        return None
+    return src
+
+
+def _review_images(rev) -> list[str]:
+    """Full-size URLs of the photos attached to the review (deduplicated, in order)."""
+    out: list[str] = []
+    for img in rev.select('img[data-hook="review-image-tile"]'):
+        src = img.get("data-src") or img.get("src")
+        if src and "/images/I/" in src and (url := _full_size(src)) not in out:
+            out.append(url)
+    return out
+
+
+def parse_reviews(html: str, base: str = "https://www.amazon.com") -> list[dict[str, Any]]:
     """Extract individual review blocks from a `/product-reviews/<ASIN>` page.
 
     Full review listing is login-gated: Amazon redirects anonymous requests to
     `/ap/signin`, which this raises as :class:`AuthRequired`. When a logged-in
     session's HTML *does* contain reviews, each one's shown content is captured
-    (including the display name on the review); reviewer profiles are not followed.
+    (including the display name, avatar and profile link shown on the review).
+    The profile itself is fetched with :meth:`AmazonWebScraper.profile`.
     """
     if "ap/signin" in html[:3000] or "<title>Amazon Sign" in html[:3000] \
             or "<title>Amazon Sign-In" in html[:3000]:
@@ -345,7 +392,7 @@ def parse_reviews(html: str) -> list[dict[str, Any]]:
     check_wall(html)
     soup = BeautifulSoup(html, "html.parser")
     out: list[dict[str, Any]] = []
-    for rev in soup.select('div[data-hook="review"]'):
+    for rev in soup.select('[data-hook="review"]'):   # <li> now, <div> before
         title_el = rev.select_one('a[data-hook="review-title"], span[data-hook="review-title"]')
         # the title anchor wraps the star icon + a span; last span is the text
         title = None
@@ -364,8 +411,68 @@ def parse_reviews(html: str) -> list[dict[str, Any]]:
             "helpful": _first(rev, 'span[data-hook="helpful-vote-statement"]'),
             "variant": _first(rev, 'a[data-hook="format-strip"]'),
             "author": _first(rev, "span.a-profile-name"),   # display name on the review
+            # As shown on the card; the profile page itself is never fetched.
+            "author_profile": _abs_profile(rev.select_one("a.a-profile"), base),
+            "author_avatar": _avatar(rev),
+            "images": _review_images(rev),
         })
     return out
+
+
+_PROFILE_ID = re.compile(r"amzn1\.account\.[A-Z0-9]+")
+
+
+def parse_profile(html: str) -> dict[str, Any]:
+    """Parse a reviewer's public profile page `/gp/profile/<amzn1.account.…>`.
+
+    Everything comes from the page's ``page-state-profile`` JSON: name, avatar,
+    bio, and the reviewer's review timeline (title, text, rating, product,
+    attached photos, helpful votes). ``next_page_token`` is non-empty when the
+    timeline continues beyond this page.
+    """
+    check_wall(html)
+    soup = BeautifulSoup(html, "html.parser")
+    state = None
+    for s in soup.select("script[data-a-state]"):
+        if "page-state-profile" in (s.get("data-a-state") or "") and s.string:
+            state = json.loads(s.string)
+            break
+    if state is None:
+        raise ValueError("no page-state-profile on this page (not a profile, or layout changed)")
+    model = state.get("profileModel") or {}
+    timeline = state.get("reviewsTimeline") or {}
+    reviews = []
+    for item in timeline.get("shopItemModels") or []:
+        rm = item.get("reviewModel")
+        if item.get("itemContentType") != "Review" or not rm:
+            continue
+        url = rm.get("viewOnAmazon") or ""
+        m = re.search(r"/customer-reviews/(R[A-Z0-9]+)", url)
+        helpful = re.match(r"\s*([\d,]+)", rm.get("helpfulVoteText") or "")
+        reviews.append({
+            "review_id": m.group(1) if m else None,
+            "rating": rm.get("rating"),
+            "title": rm.get("title"),
+            "body": rm.get("description"),
+            "product_title": rm.get("asinTitle"),
+            "product_image": rm.get("productImageUrl"),
+            "images": [v["visualElementUrl"] for v in rm.get("visualElements") or []
+                       if v.get("visualElementUrl") and not v.get("isVideo")],
+            "videos": [v["visualElementUrl"] for v in rm.get("visualElements") or []
+                       if v.get("visualElementUrl") and v.get("isVideo")],
+            "helpful": int(helpful.group(1).replace(",", "")) if helpful else None,
+            "url": url.split("?")[0] or None,
+        })
+    avatar = model.get("avatarImageURL") or None
+    return {
+        "profile_id": state.get("entityId"),
+        "name": model.get("name"),
+        "avatar": None if avatar and _is_default_avatar(avatar) else avatar,
+        "bio": model.get("bio") or None,
+        "is_influencer": bool(state.get("isInfluencer")),
+        "reviews": reviews,
+        "next_page_token": timeline.get("nextPageToken") or None,
+    }
 
 
 def parse_seller(html: str) -> dict[str, Any]:
@@ -402,7 +509,8 @@ def parse_seller_feedback(html: str) -> list[dict[str, Any]]:
 
     Each entry (`div.a-fixed-left-grid-inner` holding a `span.feedback-rater`) has
     a star rating, the comment (`.a-text-quote`), and a "By <name> on <date>" line.
-    The name shown on the entry is captured; the rater's profile is not followed.
+    Only the first page lives in the HTML; :meth:`AmazonWebScraper.seller_feedback`
+    follows the rest through `/sp/ajax/feedback`.
     """
     check_wall(html)
     soup = BeautifulSoup(html, "html.parser")
@@ -410,6 +518,8 @@ def parse_seller_feedback(html: str) -> list[dict[str, Any]]:
     for rater in soup.select("span.feedback-rater"):
         entry = rater.find_parent("div", class_="a-fixed-left-grid-inner") or rater.parent
         rater_text = _txt(rater) or ""
+        if "template-" in rater_text:
+            continue   # hidden client-side templates (template-rater / template-date)
         m = _RATER_RE.search(rater_text)
         out.append({
             "rating": _to_rating(_first(entry, ".a-icon-alt")),
@@ -421,6 +531,65 @@ def parse_seller_feedback(html: str) -> list[dict[str, Any]]:
 
 
 # --- scraper -----------------------------------------------------------------
+# Hard stop for pages=None ("all"), so a page that never empties can't loop forever.
+MAX_PAGES = 500
+
+
+def _paginate(fetch: Callable[[int], "list[dict[str, Any]] | tuple[list[dict[str, Any]], bool]"],
+              key: Callable[[dict], Any], *, pages: int | None, start_page: int
+              ) -> Iterator[dict[str, Any]]:
+    """Yield rows page by page, from ``start_page``.
+
+    ``pages`` caps how many pages are requested; ``None`` means keep going until
+    the listing ends (up to :data:`MAX_PAGES`). ``fetch(page)`` returns the rows,
+    or ``(rows, more)`` when the page itself says whether another follows.
+    Either way it also ends at the first page that is empty or adds no unseen
+    row: past the last page Amazon tends to serve the last one again rather than
+    an empty page, and some listings (reviews) ignore the page number entirely.
+    """
+    last = start_page + (pages if pages is not None else MAX_PAGES)
+    seen: set = set()
+    for page in range(start_page, last):
+        got = fetch(page)
+        rows, more = got if isinstance(got, tuple) else (got, True)
+        fresh = [r for r in rows if key(r) not in seen]
+        log.info("page %d: %d rows (%d new)%s", page, len(rows), len(fresh),
+                 "" if more else ", last page")
+        if not fresh:
+            return
+        seen.update(key(r) for r in fresh)
+        yield from fresh
+        if not more:
+            return
+
+
+def _has_next_page(html: str) -> bool:
+    """Whether a `/s` results page links to a following page (its Next button)."""
+    return "s-pagination-next" in html and "s-pagination-next s-pagination-disabled" not in html
+
+
+def _feedback_key(r: dict[str, Any]) -> tuple:
+    # Feedback entries have no id; the shown fields together identify one.
+    return (r.get("rated_by"), r.get("date"), r.get("comment"), r.get("rating"))
+
+
+def _feedback_from_json(d: dict[str, Any]) -> dict[str, Any]:
+    """One entry from `/sp/ajax/feedback` JSON, in :func:`parse_seller_feedback`'s shape."""
+    rd = d.get("ratingData") or {}
+    text = rd.get("text") or {}
+    avatar = d.get("raterAvatarUrl")
+    profile = d.get("raterProfileUrl")
+    return {
+        "rating": float(d["rating"]) if d.get("rating") is not None else None,
+        "comment": text.get("expandedText") or text.get("truncatedText"),
+        "rated_by": d.get("rater"),
+        "date": rd.get("date"),
+        "rater_profile": ("https://www.amazon.com" + profile) if profile and profile.startswith("/") else profile,
+        "rater_avatar": None if not avatar or _is_default_avatar(avatar) else avatar,
+        "suppressed": bool(rd.get("wasSuppressed")),
+    }
+
+
 class AmazonWebScraper:
     """Reuse a web session's cookies against the storefront, for any marketplace."""
 
@@ -479,17 +648,18 @@ class AmazonWebScraper:
     def is_authenticated(self) -> bool:
         """Report whether this session is signed in.
 
-        Authoritative probe: request Your Orders, which Amazon serves only to a
-        signed-in user and otherwise redirects to `/ap/signin`.
+        Probe: a product page, whose nav greets a signed-in user by name and
+        carries a sign-out link (:func:`scraper.auth.is_signed_in`). Your Orders
+        can't be used: it demands a fresh sign-in (``max_auth_age=0``), so even a
+        valid session is bounced to ``/ap/signin`` → ``/ax/claim`` once its
+        sign-in is a few minutes old.
         """
+        from .auth import is_signed_in
         try:
-            resp = self._get("/gp/css/order-history")
+            resp = self._get(f"/dp/{_SEED_ASIN}")
         except BotWall:
             return False
-        # The sign-in bounce can chain on (…/ap/signin → …/ax/claim), so inspect
-        # the whole redirect history, not just the final URL.
-        chain = [str(h.url) for h in resp.history] + [str(resp.url)]
-        return not any(("/ap/signin" in u or "/ap/claim" in u) for u in chain)
+        return is_signed_in(resp.text)
 
     @classmethod
     def open(cls, marketplace: str = "us", *, zip_code: str | None = None,
@@ -552,29 +722,31 @@ class AmazonWebScraper:
                                  params=params, headers=self._headers())
 
     # -- collection methods ----------------------------------------------------
-    def search(self, keyword: str, *, pages: int = 1, start_page: int = 1
+    def search(self, keyword: str, *, pages: int | None = 1, start_page: int = 1
                ) -> Iterator[dict[str, Any]]:
-        """Yield product cards for `keyword`, paginating `/s` via `&page=`."""
-        for page in range(start_page, start_page + pages):
-            resp = self._get("/s", {"k": keyword, "page": str(page), "ref": "nb_sb_noss"})
-            rows = parse_search(resp.text, base=self.base)
-            if not rows:
-                break
-            yield from rows
+        """Yield product cards for `keyword`, paginating `/s` via `&page=`.
 
-    def browse(self, node: str, *, pages: int = 1, start_page: int = 1
+        ``pages=None`` walks every page Amazon serves for the query.
+        """
+        return _paginate(
+            lambda page: self._search_page({"k": keyword, "page": str(page), "ref": "nb_sb_noss"}),
+            key=lambda r: r["asin"], pages=pages, start_page=start_page)
+
+    def browse(self, node: str, *, pages: int | None = 1, start_page: int = 1
                ) -> Iterator[dict[str, Any]]:
         """Yield product cards for a category browse node, paginating `/s`.
 
         `fs=true` forces the search-results grid; a bare `?node=` renders a
-        merchandised landing page with no parseable cards.
+        merchandised landing page with no parseable cards. ``pages=None`` walks
+        every page.
         """
-        for page in range(start_page, start_page + pages):
-            resp = self._get("/s", {"rh": f"n:{node}", "fs": "true", "page": str(page)})
-            rows = parse_search(resp.text, base=self.base)
-            if not rows:
-                break
-            yield from rows
+        return _paginate(
+            lambda page: self._search_page({"rh": f"n:{node}", "fs": "true", "page": str(page)}),
+            key=lambda r: r["asin"], pages=pages, start_page=start_page)
+
+    def _search_page(self, params: dict[str, str]) -> tuple[list[dict[str, Any]], bool]:
+        html = self._get("/s", params).text
+        return parse_search(html, base=self.base), _has_next_page(html)
 
     def product(self, asin: str) -> dict[str, Any]:
         """Fetch and parse one `/dp/<ASIN>` product page."""
@@ -582,6 +754,18 @@ class AmazonWebScraper:
         if not data.get("asin"):
             data["asin"] = asin
         return data
+
+    def top_reviews(self, asin: str) -> list[dict[str, Any]]:
+        """The reviews shown on the product page itself (`/dp/<ASIN>`).
+
+        On some stores (amazon.fr: 13 cards) these are served anonymously, while
+        the full `/product-reviews` list needs sign-in; on amazon.com the
+        anonymous product page shows none.
+        """
+        rows = parse_reviews(self._get(f"/dp/{asin}").text, self.base)
+        for r in rows:
+            r["asin"] = asin
+        return rows
 
     def review_summary(self, asin: str) -> dict[str, Any]:
         """Aggregate review data (average, count, star histogram) from `/dp`.
@@ -592,31 +776,48 @@ class AmazonWebScraper:
         data["asin"] = asin
         return data
 
-    def reviews(self, asin: str, *, pages: int = 1, start_page: int = 1,
+    def reviews(self, asin: str, *, pages: int | None = 1, start_page: int = 1,
                 sort: str = "recent") -> Iterator[dict[str, Any]]:
         """Yield individual reviews, paginating `/product-reviews/<ASIN>`.
 
         Anonymous sessions are redirected to sign-in; this raises
         :class:`AuthRequired`. Use :meth:`review_summary` for anonymous aggregate
         data, or supply a logged-in session (via `--curl`/`--cookies`) for text.
+        ``pages=None`` walks every page. Amazon currently ignores the page number
+        and serves the same featured reviews each time, so this stops after the
+        first page (README, Finding 9).
         """
-        for page in range(start_page, start_page + pages):
+        def fetch(page: int) -> list[dict[str, Any]]:
             resp = self._get(f"/product-reviews/{asin}", {
                 "pageNumber": str(page), "sortBy": sort, "reviewerType": "all_reviews"})
             if "/ap/signin" in str(resp.url):
                 raise AuthRequired("/product-reviews redirects to sign-in (login required); "
                                    "use review_summary() for anonymous aggregate data")
-            rows = parse_reviews(resp.text)
-            if not rows:
-                if page == start_page and not self.authenticated:
-                    # Anonymous sessions get a page with no review text (lazy/gated).
-                    raise AuthRequired(
-                        "no anonymous review text (login-gated); use review_summary() "
-                        "or AmazonWebScraper.authenticated(cookies=…)")
-                break
+            rows = parse_reviews(resp.text, self.base)
+            if not rows and page == start_page and not self.authenticated:
+                # Anonymous sessions get a page with no review text (lazy/gated).
+                raise AuthRequired(
+                    "no anonymous review text (login-gated); use review_summary() "
+                    "or AmazonWebScraper.authenticated(cookies=…)")
             for r in rows:
                 r["asin"] = asin
-            yield from rows
+            return rows
+
+        return _paginate(fetch, key=lambda r: r["id"], pages=pages, start_page=start_page)
+
+    def profile(self, profile: str) -> dict[str, Any]:
+        """Fetch and parse a reviewer's public profile.
+
+        ``profile`` is an ``amzn1.account.…`` id or a profile URL, e.g. the
+        ``author_profile`` of a row from :meth:`reviews`.
+        """
+        m = _PROFILE_ID.search(profile)
+        if not m:
+            raise ValueError(f"not a profile id or URL: {profile!r}")
+        resp = self._get(f"/gp/profile/{m.group(0)}")
+        if "/ap/signin" in str(resp.url):
+            raise AuthRequired("/gp/profile redirects to sign-in (login required)")
+        return parse_profile(resp.text)
 
     def seller(self, seller_id: str) -> dict[str, Any]:
         """Fetch and parse a seller ("company") page `/sp?seller=<ID>`."""
@@ -624,14 +825,59 @@ class AmazonWebScraper:
         data["seller_id"] = seller_id
         return data
 
-    def seller_feedback(self, seller_id: str, *, pages: int = 1, start_page: int = 1
+    def seller_feedback(self, seller_id: str, *, pages: int | None = 1, start_page: int = 1
                         ) -> Iterator[dict[str, Any]]:
-        """Yield a seller's feedback entries from the `/sp` page, paginating it."""
-        for page in range(start_page, start_page + pages):
-            resp = self._get("/sp", {"seller": seller_id, "pageNumber": str(page)})
-            rows = parse_seller_feedback(resp.text)
-            if not rows:
-                break
-            for r in rows:
-                r["seller_id"] = seller_id
-            yield from rows
+        """Yield a seller's feedback entries, following the feedback cursor.
+
+        Page 1 is the `/sp` page itself. Its *Next* link carries a keyset cursor
+        (``lastEvaluatedKey``); each following page is one
+        ``GET /sp/ajax/feedback?…&lastEvaluatedKey=…`` returning JSON with the
+        entries, ``hasNextPage`` and the next cursor (`pageNumber` is ignored).
+        A cursor can't jump ahead, so ``start_page`` > 1 walks and skips.
+        ``pages=None`` follows the cursor to the end (up to :data:`MAX_PAGES`).
+        """
+        html = self._get("/sp", {"seller": seller_id}).text
+        rows = parse_seller_feedback(html)
+        m = re.search(r'data-spp-feedback-link-next-page="([^"]+)"', html)
+        params = json.loads(_html.unescape(m.group(1))) if m else None
+        last = start_page + (pages if pages is not None else MAX_PAGES)
+        seen: set = set()
+        page = 1
+        while True:
+            fresh = [r for r in rows if _feedback_key(r) not in seen]
+            seen.update(_feedback_key(r) for r in fresh)
+            log.info("feedback page %d: %d entries (%d new)", page, len(rows), len(fresh))
+            if page >= start_page:
+                for r in fresh:
+                    r["seller_id"] = seller_id
+                yield from fresh
+            page += 1
+            if not fresh or not params or page >= last:
+                return
+            data = self.client.fetch("GET", f"{self.base}{params.get('url', '/sp/ajax/feedback')}",
+                                     params={"seller": seller_id,
+                                             "marketplaceID": params.get("marketplaceID", self.marketplace_id),
+                                             "pageElement": "feedback-next", "pageTouchTracking": "true",
+                                             "lastEvaluatedKey": params["lastEvaluatedKey"]},
+                                     headers=self._xhr_headers(f"/sp?seller={seller_id}")).json()
+            rows = [_feedback_from_json(d) for d in data.get("details") or []]
+            cursor = data.get("lastEvaluatedKey") or (data.get("actionParams") or {}).get("lastEvaluatedKey")
+            params = dict(params, lastEvaluatedKey=cursor) if data.get("hasNextPage") and cursor else None
+            if not params:
+                # Last batch: yield it, then stop.
+                fresh = [r for r in rows if _feedback_key(r) not in seen]
+                log.info("feedback page %d: %d entries (%d new), last page", page, len(rows), len(fresh))
+                if page >= start_page:
+                    for r in fresh:
+                        r["seller_id"] = seller_id
+                    yield from fresh
+                return
+
+    def _xhr_headers(self, referer_path: str) -> dict[str, str]:
+        """Headers for the storefront's own XHR calls (JSON/fragments, not documents)."""
+        h = self._headers()
+        h.pop("upgrade-insecure-requests", None)
+        h.update({"accept": "application/json, text/html, */*", "x-requested-with": "XMLHttpRequest",
+                  "referer": f"{self.base}{referer_path}", "sec-fetch-mode": "cors",
+                  "sec-fetch-dest": "empty", "sec-fetch-site": "same-origin"})
+        return h

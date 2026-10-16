@@ -80,6 +80,8 @@ def bootstrap(client: ScraperClient, marketplace: str = "us", *,
     nav = _nav_headers(language)
 
     page = client.fetch("GET", f"{base}/dp/{seed_asin}", headers=nav)
+    from .amazon_web import check_wall   # local: amazon_web imports this module
+    check_wall(page.text)                # a robot-check page sets no cookie either
     if "session-id" not in client.cookies:
         raise SessionError(f"seed page set no session cookie (HTTP {page.status_code})")
     log.info("session seeded (%s): %s", marketplace, sorted(client.cookies.keys()))

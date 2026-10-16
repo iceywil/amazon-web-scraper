@@ -34,28 +34,42 @@ cp "\$STORE"/* "\$TMP"/ 2>/dev/null || true
 cp "/data/local/tmp/$name" "\$TMP/$name"
 chmod 644 "\$TMP"/*
 chown root:root "\$TMP"/*
-chcon u:object_r:system_certificates_file:s0 "\$TMP"/* 2>/dev/null || true
+chcon u:object_r:system_security_cacerts_file:s0 "\$TMP"/* 2>/dev/null || true
 
 # Mount it over the store in THIS namespace...
 mount -t tmpfs tmpfs "\$STORE"
 cp "\$TMP"/* "\$STORE"/
 chmod 644 "\$STORE"/*
-chcon u:object_r:system_certificates_file:s0 "\$STORE"/* 2>/dev/null || true
+chcon u:object_r:system_security_cacerts_file:s0 "\$STORE"/* 2>/dev/null || true
 
 # ...then replicate the same mount inside init's (PID 1) namespace so already
 # running zygote/app processes pick it up without a reboot.
 nsenter --mount=/proc/1/ns/mnt -- mount -t tmpfs tmpfs "\$STORE"
 nsenter --mount=/proc/1/ns/mnt -- sh -c "cp \$TMP/* \$STORE/ && \
     chmod 644 \$STORE/* && \
-    (chcon u:object_r:system_certificates_file:s0 \$STORE/* 2>/dev/null || true)"
+    (chcon u:object_r:system_security_cacerts_file:s0 \$STORE/* 2>/dev/null || true)"
+
+# Mounts made in init's namespace don't reach zygote's, and apps fork from
+# zygote, so repeat the overlay there. The label must match the stock store's
+# (system_security_cacerts_file); with anything else apps can't read it and
+# trust nothing, which breaks every WebView page (sign-in included).
+Z=\$(pidof zygote64 || pidof zygote)
+nsenter -t \$Z -m -- sh -c "mount -t tmpfs tmpfs \$STORE && cp \$TMP/* \$STORE/ && \
+    chown root:root \$STORE/* && chmod 644 \$STORE/* && chmod 755 \$STORE && \
+    chcon u:object_r:system_security_cacerts_file:s0 \$STORE \$STORE/*"
 
 echo "    store now holds \$(ls "\$STORE" | wc -l | tr -d ' ') certs"
 SH
 
 echo "==> verifying the CA is visible to apps"
-subj="$(adb shell su 0 nsenter --mount=/proc/1/ns/mnt -- cat "/apex/com.android.conscrypt/cacerts/$name" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || true)"
+zpid="$(adb shell pidof zygote64 | awk '{print $1}')"
+subj="$(adb shell su 0 nsenter -t "$zpid" -m -- cat "/apex/com.android.conscrypt/cacerts/$name" 2>/dev/null | openssl x509 -noout -subject 2>/dev/null || true)"
 if echo "$subj" | grep -qi mitmproxy; then
-    echo "    OK: $subj (visible in init namespace)"
+    label="$(adb shell su 0 nsenter -t "$zpid" -m -- ls -Z "/apex/com.android.conscrypt/cacerts/$name")"
+    case "$label" in
+        *system_security_cacerts_file*) echo "    OK: $subj (visible to apps via zygote, label ok)" ;;
+        *) echo "    WARNING: wrong SELinux label, apps can't read it: $label" >&2 ;;
+    esac
 else
     echo "    WARNING: could not confirm the CA; check manually" >&2
 fi

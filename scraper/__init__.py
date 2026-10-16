@@ -24,6 +24,7 @@ Collection methods (all iterators paginate lazily):
     product(asin)              one product's detail                 -> dict
     review_summary(asin)       average + total + star histogram     -> dict
     reviews(asin)              individual review text (login-gated)  -> dict rows
+    profile(profile_id)        a reviewer's public profile + reviews -> dict
     seller(seller_id)          a seller ("company") page            -> dict
     seller_feedback(seller_id) a seller's feedback entries          -> dict rows
 
@@ -37,13 +38,14 @@ from .amazon_web import (
     AuthRequired,
     BotWall,
     parse_product,
+    parse_profile,
     parse_review_summary,
     parse_reviews,
     parse_search,
     parse_seller,
     parse_seller_feedback,
 )
-from .auth import cookies_from_browser, cookies_from_file, is_signed_in
+from .auth import cookies_from_browser, cookies_from_file, is_signed_in, login_in_browser
 from .capture import CapturedRequest, load_curl_file
 from .client import RateLimiter, ScraperClient
 from .metrics import Metrics
@@ -61,9 +63,11 @@ __all__ = [
     "cookies_from_file",
     "cookies_from_browser",
     "is_signed_in",
+    "login_in_browser",
     # parsers (operate on raw HTML you already have)
     "parse_search",
     "parse_product",
+    "parse_profile",
     "parse_review_summary",
     "parse_reviews",
     "parse_seller",

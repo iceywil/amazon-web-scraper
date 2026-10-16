@@ -15,3 +15,12 @@ android/setup.log
 apk/
 out/
 session*.json
+mailtm.json
+.env
+output/
+output.json
+.env.*
+*.mitm
+*.curl
+*cookies*.json
+.DS_Store

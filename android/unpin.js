@@ -67,5 +67,25 @@ Java.perform(function () {
             function () { note('okhttp3 OkHostnameVerifier.verify'); return true; };
     } catch (e) {}
 
+    // 5) WebView (Chromium) verifies through X509TrustManagerExtensions, which
+    //    none of the above reaches. The sign-in / sign-up pages are WebViews,
+    //    so without this they fail with net_error -202 when the CA isn't readable.
+    try {
+        var TME = Java.use('android.net.http.X509TrustManagerExtensions');
+        var Arrays = Java.use('java.util.Arrays');
+        TME.checkServerTrusted.overloads.forEach(function (ov) {
+            ov.implementation = function (chain) {
+                note('X509TrustManagerExtensions.checkServerTrusted (WebView)');
+                return Arrays.asList(chain);
+            };
+        });
+    } catch (e) {}
+
+    // 6) Belt and braces for WebViews: proceed past any SSL error callback.
+    try {
+        Java.use('android.webkit.WebViewClient').onReceivedSslError.implementation =
+            function (view, handler, error) { note('WebViewClient.onReceivedSslError -> proceed'); handler.proceed(); };
+    } catch (e) {}
+
     console.log('[unpin] hooks installed; open a product/search screen to generate traffic');
 });

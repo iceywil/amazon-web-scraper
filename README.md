@@ -4,6 +4,38 @@ A reverse-engineering-style data collection tool built against the backend API o
 the **Amazon Shopping** mobile app. It intercepts the app's traffic, documents how
 the API works, and replays captured requests through a polite, resilient client.
 
+## Quick test
+
+Copy and paste. It sets up the environment, then asks what to search:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate && pip install -e . && python quickstart.py
+```
+
+```
+Search amazon.fr for: cat food
+```
+
+It searches **amazon.fr**, then prints in the terminal:
+
+1. the **first result**: title, ASIN, price, rating, URL;
+2. the **first review on its page that has a photo**: rating, title, author,
+   date, text (if the first result has none, it tries the next few results);
+3. that **reviewer's public profile**: name, bio, number of reviews, profile picture.
+
+The product photo, the review photos and the reviewer's profile picture are saved
+under `output/assets/`, and everything is exported to **`output.json`**. Terminals
+that support inline images (iTerm2, WezTerm, VS Code with
+`terminal.integrated.enableImages`) also show the pictures inline.
+
+No account is needed: amazon.fr serves a product's top reviews on the product
+page itself, and reviewer profiles are public. Already set up? Just run
+`python quickstart.py`, or skip the prompt with `python quickstart.py "cat food"`
+(`--marketplace uk`, `--out file.json` to change the defaults).
+
+If Amazon shows this IP its robot check, the script says so and exits. Wait a
+while (minutes to an hour) and run it again.
+
 ---
 
 ## 1. Methodology (how the endpoints were found)
@@ -35,9 +67,13 @@ android/capture.sh           # proxy -> mitmweb, launch Amazon with cert-unpinni
 ```
 
 `install_ca.sh` handles the Android 14+ change where the CA store moved into the
-read-only Conscrypt APEX: it overlays a tmpfs copy into **init's** mount namespace
-so every app inherits it. `unpin.js` neutralises the extra pinning layers
-(OkHttp `CertificatePinner`, `TrustManagerImpl`, custom `X509TrustManager`s).
+read-only Conscrypt APEX: it overlays a tmpfs copy of the store, plus our CA, in
+**init's** and **zygote's** mount namespaces. Every app forks from zygote, so the
+second one is the one that counts. The copy must carry the stock store's SELinux
+label, `system_security_cacerts_file`. With any other label, apps get `EACCES`
+reading the store and trust nothing (see Finding 8). `unpin.js` neutralises the
+extra pinning layers (OkHttp `CertificatePinner`, `TrustManagerImpl`, custom
+`X509TrustManager`s).
 
 ### What a live capture revealed
 
@@ -212,9 +248,10 @@ What the HTML plane exposes to an anonymous session, now implemented in
 | Category listing | `/s?rh=n:<node>&fs=true` | ✅ | `parse_search` (`fs=true` forces the grid; a bare node is a landing page) |
 | Product detail | `/dp/<ASIN>` | ✅ | `parse_product` (+ brand, availability, bullets, seller, seller_id) |
 | **Review aggregate** | `/dp` `#reviewsMedley` | ✅ | `parse_review_summary` (average, total, per-star histogram) |
-| Individual review *text* | `/product-reviews/<ASIN>` | ❌ **login** | redirects to `/ap/signin` → `AuthRequired` |
+| Individual review *text* | `/product-reviews/<ASIN>` | ❌ **login** | anonymous: `AuthRequired`; signed in: 8 featured reviews per product (Finding 9) |
 | Seller ("company") | `/sp?seller=<ID>` | ✅ | `parse_seller` (name, rating, business info) |
-| Seller feedback | `/sp?seller=<ID>` | ✅ | `parse_seller_feedback` (rating, comment, rater name, date) |
+| Seller feedback | `/sp?seller=<ID>`, then `/sp/ajax/feedback` | ✅ | `parse_seller_feedback` (rating, comment, rater name, date); later pages as JSON with rater profile/avatar and a `suppressed` flag |
+| Reviewer profile | `/gp/profile/<amzn1.account.…>` | ✅ | `parse_profile` (name, avatar, bio, influencer flag, the reviewer's reviews with photos) |
 
 Two honest limits:
 - **Full review text is login-gated.** The aggregate/histogram is anonymous; the
@@ -222,13 +259,149 @@ Two honest limits:
   `LOGIN REQUIRED` and `web-review-summary` is the substitute. Full text is
   available by supplying a session **you logged into yourself** — see
   *Authenticated access* in §2 (`AmazonWebScraper.authenticated` /
-  `--auth-cookies`); the library never automates login.
+  `--auth-cookies`); the library never automates login. Even signed in, only
+  the 8 featured reviews come back (Finding 9).
 - **Prices follow egress geography.** Our egress geolocates to India, so
   `amazon.co.uk` returns prices in **INR**, not GBP — the number is correct, the
   currency is the visitor's. We therefore record `currency` on every price; true
   local pricing needs in-country egress.
-- **Reviewer/feedback author** names are captured *as shown on the entry*; we do
-  not crawl individual reviewer profiles.
+- **Reviewer profiles are a separate request.** A review row carries the
+  author's name, avatar and profile link as shown on the card; `profile()`
+  fetches the profile itself (Finding 10). Seller-feedback entries past page 1
+  also carry the rater's profile link and avatar (`rater_profile`, `rater_avatar`).
+
+#### Finding 8 — the sign-in / sign-up flow (captured with your own account)
+
+`login_in_browser(app=True)` (see *Authenticated access* in §2) recorded a real
+sign-up followed by a sign-in inside the app, with the account holder typing on
+the device. Each step, from `android/flows/login.ndjson`:
+
+| t | Request | What it does |
+|---|---------|--------------|
+| 120 s | `GET /ap/register` | sign-up form |
+| 168 s | `POST /ax/claim` → `302 /ax/claim/intent` | **email first**: a "unified auth" step checks the identifier before any password is asked |
+| 173 s | `POST /ap/register` (`email`, `arb`, `anti-csrftoken-a2z`) | email accepted; fresh `session-id`, `ubid-main`, `session-token` |
+| 198 s | `POST /ap/register` (`customerName`, `encryptedPwd`, `metadata1`, `workflowState`, …) | account created |
+| 399 s | `GET /ap/signin` → `POST /ax/claim` | sign-in, again email first |
+| 422 s | `POST /ap/signin` → `302 /ap/maplanding` | **auth cookies set**: `x-main`, `at-main`, `sess-at-main` |
+| 424 s | `POST api.amazon.com/auth/register` | the app registers itself as a **device** on the account (MAP) |
+| 424–426 s | 5 × `POST api.amazon.com/auth/token` | exchanges that registration for per-service app tokens |
+| 426 s → | `www.amazon.com/…`, `data.amazon.com/api/…/customer/…` | signed-in web pages and the native API now run as the account |
+
+What this shows:
+
+- **Two credentials come out of one sign-in.** The web plane gets cookies
+  (`at-main`/`sess-at-main`/`x-main`, plus the usual session cookies). The native
+  plane gets device-bound MAP tokens from `/auth/register` + `/auth/token`. The
+  cookies alone are enough for the scraper: the 12-cookie jar from this run
+  passed the signed-in check in `AmazonWebScraper.authenticated()`.
+- **Sensitive pages need a fresh sign-in.** Your Orders asks for re-authentication
+  (`/ap/signin?openid.pape.max_auth_age=0` → `/ax/claim`) once a sign-in is a few
+  minutes old, for a valid session and an anonymous one alike. So it can't tell
+  them apart, and `is_authenticated()` instead checks a product page for the
+  signed-in greeting and sign-out link (`is_signed_in`). The session itself stayed
+  valid: hours later it still read reviews and greeted the account by name.
+- **The password never travels in clear form fields.** The page encrypts it
+  client-side into `encryptedPwd` (`encryptedPasswordExpected=true`). `metadata1`
+  is a device/browser fingerprint blob the page computes, and `appActionToken`,
+  `workflowState`, `anti-csrftoken-a2z` and `prevRID` chain the steps together.
+  So a sign-in has to run the real page; it can't be replayed from a template.
+- **No OTP or captcha** was asked on this run (new account, emulator, Indonesian
+  egress IP). The addon labels `/ap/cvf/*` and `/ap/mfa` steps when they appear.
+- **The sign-in screens are WebViews running inside the app's own process,
+  through Chromium's network stack.** Frida's `unpin.js` hooks don't reach that
+  path, so these pages need the CA to be *genuinely* trusted by the system store.
+  That is how the label bug surfaced: anonymous browsing had worked for days
+  through the hooks, but the first tap on *Sign in* failed with "Please check
+  your Internet connection" (logcat: `net_error -202`, `ERR_CERT_AUTHORITY_INVALID`).
+- **The CA label bug, in detail.** The original `install_ca.sh` relabelled the
+  overlay as `system_certificates_file`, a type that doesn't exist on this image,
+  so `chcon` failed silently and the files kept `appdomain_tmpfs`. Root could
+  read them (so the old check passed), but apps got `EACCES`. The overlay also
+  lived only in init's namespace, which zygote doesn't inherit. Two approaches
+  that do **not** work, for the record: bind-mounting a labelled directory from
+  `/data` (the kernel treats the label as `unlabeled` there, so every new app
+  crashed in `TrustedCertificateStore`), and remounting the store in running
+  processes (they have already cached the broken store). Fix: overlay in
+  zygote's namespace, label `system_security_cacerts_file`, then (re)start the app.
+- **Screenshots of the sign-in screens are black.** `AuthPortalUIActivity` sets
+  `FLAG_SECURE`; the screen shows normally in the emulator window.
+- **Startup re-fork.** The app sometimes replaces its first process right after
+  launch, so the Frida attach can miss (`could not attach: no pid`). Relaunch the
+  app and attach again.
+- **Don't kill a Frida session hard while it's attached.** Killing the client
+  (`pkill`) left zygote aborting in a loop (`session socket read failed`) until
+  the emulator was rebooted.
+
+Redaction: the addon removes what was typed (`email`, `password`,
+`encryptedPwd`, `customerName`, OTP fields) from `login.mitm`. `encryptedPwd`
+was added after this run showed Amazon's field name, and the run's file was
+re-scrubbed. Tokens and cookies are kept, which is the point of the capture.
+
+#### Finding 9 — reviews with a signed-in session: 8 featured, no paging
+
+Using the session from Finding 8 (`--auth-cookies android/flows/login_cookies.json`):
+
+- **Login does unlock review text.** Anonymously, `/product-reviews/<ASIN>` has
+  no review cards (and `/dp` shows none either). Signed in, the page greets the
+  account by name and carries **8 full reviews**: id, rating, title, body, date,
+  verified badge, helpful count, variant and display name all parse. Checked on
+  two products (`B00G2XGC88`, `B083TCZDMT`).
+- **The markup changed.** Each review is now `<li data-hook="review">` (it was a
+  `<div>`), which made `parse_reviews` return nothing until the selector was
+  widened to `[data-hook="review"]`.
+- **Nothing beyond those 8.** `pageNumber`, `sortBy` (`recent`/`helpful`),
+  `filterByStar` (even `one_star`) and `reviewerType` are all ignored: every
+  variant returned the same eight 4–5★ reviews. The page has no pagination bar.
+  Its config names an AJAX endpoint,
+  `POST /portal/customer-reviews/ajax/reviews/get/` (form fields `asin`,
+  `pageNumber`, `pageSize`, `sortBy`, `filterByStar`, `scope`, …, header
+  `anti-csrftoken-a2z` = the page's `reviewsCsrfToken`). It answers `200` in
+  Amazon's streaming format (JSON chunks `["append"|"update", "#selector",
+  "<html>"]` separated by `&&&`). But for page 2+ it reports **"No customer
+  reviews"**, empties `#cm_cr-pagination_bar`, and re-appends the same 8.
+- So `reviews()` now stops at the first page that adds no new review id, instead
+  of yielding the same 8 for every page requested.
+- **The app gets the same 8.** Reviews exist only on the web plane: the app
+  shows them in a WebView, and the native AAPI (`data.amazon.com`) serves none.
+  Requested with the app WebView's own User-Agent (`…; wv) … Mobile Safari`),
+  `/product-reviews/<ASIN>` and `/gp/aw/reviews/<ASIN>` return a mobile layout
+  (`data-hook="mobley-review-content"`) with the **same 8 review ids** as the
+  desktop page, the same `reviewsAjaxUrl`, and nothing new on page 2. The
+  scraper stays on the desktop layout, which parses the same data more simply.
+- **Not yet known:** whether this cap depends on the account (brand new, no
+  orders), the egress region (geolocated to Indonesia), or is the same for
+  everyone.
+- **What each review card carries**, and what `parse_reviews` now records from
+  it:
+  - `images`: photos attached to the review (`img[data-hook="review-image-tile"]`).
+    The thumbnails end in a resize directive (`…/I/714zIXoRKlL._SY88.jpg`);
+    dropping it gives the original upload (`…/I/714zIXoRKlL.jpg`, here 134 KB
+    JPEG).
+  - `author_avatar`: the avatar shown on the card (`amazon-avatars-global/…`),
+    or `None` when it is the default silhouette (7 of the 8 here).
+  - `author_profile`: the profile link shown on the card
+    (`/gp/profile/amzn1.account.…`), with the `/ref=` tracking suffix removed.
+  - The profile itself is fetched separately with `profile()` (Finding 10).
+
+#### Finding 10 — reviewer profiles are public, and carry the reviewer's reviews
+
+`/gp/profile/<amzn1.account.…>` (the `author_profile` on each review) answers
+**anonymously**: no sign-in needed, unlike review lists. The page embeds its data
+as JSON in `<script data-a-state='{"key":"page-state-profile"}'>`:
+
+- `profileModel`: `name`, `avatarImageURL`, `bio`, plus `isInfluencer`.
+- `reviewsTimeline.shopItemModels[]`: the reviewer's reviews, each with `title`,
+  `description` (full text), `rating`, `asinTitle`, `productImageUrl`,
+  `visualElements` (attached photos and videos, already full size),
+  `helpfulVoteText` and `viewOnAmazon` (→ the review id `R…`).
+- `reviewsTimeline.nextPageToken`: empty on both profiles tried (19 and 20
+  reviews), so how the timeline continues for prolific reviewers is still unknown.
+  `parse_profile` returns the token as `next_page_token` so a non-empty one shows up.
+- The timeline gives the product *title and image* but no ASIN.
+
+`parse_profile` / `AmazonWebScraper.profile()` / `web-profile` turn this into one
+record per profile, with `reviews` as a list.
 
 #### Mining a capture yourself
 
@@ -238,9 +411,10 @@ python android/analyze_flows.py android/flows/session.mitm --host www.amazon.com
 python android/analyze_flows.py android/flows/session.mitm --grep /suggestions --show 1
 ```
 
-> Everything here runs on your own emulator against an anonymous (skip-sign-in)
-> session, to *document* the protocol. It defeats no protection on anyone else's
-> device and collects no account data. Captured flows and any exported cURL files
+> Everything here runs on your own emulator, against an anonymous session or,
+> for Finding 8, an account you created and signed into yourself, to *document*
+> the protocol. It defeats no protection on anyone else's device and collects
+> no one else's account data. Captured flows and any exported cURL files
 > hold session cookies/tokens, so they are git-ignored — keep them that way.
 
 ---
@@ -268,13 +442,34 @@ Public API (`from scraper import …`):
 | `AmazonWebScraper.open(marketplace, zip_code=…)` | ready scraper | mints a session |
 | `.search(keyword, pages=…)` | iter of dict | `/s` product cards |
 | `.browse(node, pages=…)` | iter of dict | `/s?rh=n:` category |
+| `.profile(profile_id)` | dict | `/gp/profile` reviewer profile + their reviews |
 | `.product(asin)` | dict | `/dp` detail |
 | `.review_summary(asin)` | dict | `/dp` rating + histogram |
 | `.reviews(asin, pages=…)` | iter of dict | `/product-reviews` (login-gated → `AuthRequired`) |
 | `.seller(seller_id)` | dict | `/sp` seller page |
-| `.seller_feedback(seller_id, pages=…)` | iter of dict | `/sp` feedback entries |
+| `.seller_feedback(seller_id, pages=…)` | iter of dict | `/sp` + `/sp/ajax/feedback` entries |
 | `mint_session(marketplace, zip_code=…)` | session dict | raw session cookies |
 | `parse_search / parse_product / parse_review_summary / parse_seller / …` | records | parse HTML you already have |
+
+**Deep pagination.** Every paginated method takes `pages=N`, or `pages=None` to
+follow the listing to its end (CLI: `--pages all`; `-v` logs each page). How each
+one ends:
+
+| Method | How it pages | Ends when |
+|---|---|---|
+| `search`, `browse` | `/s?…&page=N` | the page's *Next* button is disabled (Amazon's last page), or a page adds no new ASIN |
+| `seller_feedback` | page 1 from `/sp`, then a `lastEvaluatedKey` cursor through `/sp/ajax/feedback` (JSON) | `hasNextPage` is false |
+| `reviews` | `/product-reviews/<ASIN>?pageNumber=N` | a page adds no new review id: today after page 1, since Amazon ignores the page number (Finding 9) |
+| `profile` | one page | no continuation seen yet: `next_page_token` was empty on every profile tried |
+
+Every walk stops at the first page that adds nothing new (Amazon often repeats
+its last page instead of returning an empty one), with a hard cap of
+`MAX_PAGES` (500) as a backstop. Measured: `search("cast iron skillet")` →
+7 pages, 313 unique products; a 400-page category (`browse("289814")`) runs all
+400 pages, about 39 cards each, at the default 1 req/s; one seller's feedback →
+27 pages, 131 entries (115 counted + 15 that Amazon suppressed from the rating +
+1, flagged `suppressed`). Cursor-based feedback can't jump ahead, so
+`start_page` > 1 walks from page 1 and skips.
 
 ```
 scraper/
@@ -307,20 +502,77 @@ from scraper import AmazonWebScraper, cookies_from_file
 cookies = cookies_from_file("amazon_cookies.txt")          # Netscape cookies.txt or JSON export
 with AmazonWebScraper.authenticated(cookies, "us") as amz:  # verifies you're signed in
     for r in amz.reviews("B00G2XGC88", pages=2):
-        print(r["rating"], r["title"], r["author"], r["verified"])
+        print(r["rating"], r["title"], r["author"], r["verified"], r["images"])
 ```
 
 `cookies_from_browser("chrome", "amazon.com")` can read them straight from your
 local browser instead (needs the `browser` extra: `pip install -e ".[browser]"`).
-`AmazonWebScraper.authenticated(...)` probes an account page and raises
+`AmazonWebScraper.authenticated(...)` checks a product page for the signed-in greeting and raises
 `AuthRequired` if the cookies aren't a signed-in session. The CLI mirrors this:
 
 ```bash
 python -m scraper.cli web-reviews --auth-cookies amazon_cookies.txt --asin B00G2XGC88 --pages 2
 ```
 
-Scope note: only *your own* session is used, reviewer names are kept as shown on
-each review, and reviewer profiles are never crawled.
+**Or sign in on the emulator and record the flow.** `login_in_browser()` points
+the emulator at mitmdump, opens Amazon's sign-in, and waits while *you* sign in
+(or create an account) on the device. It prints each step as it happens and
+returns the session once the auth cookies appear. Use `app=True` (`--app`) to
+sign in through the Amazon app; that also records the app's device registration.
+Without it, the emulator's Chrome is used:
+
+```python
+from scraper import AmazonWebScraper, login_in_browser
+
+cookies = login_in_browser("us")             # app=True: use the Amazon app (Frida-unpinned)
+with AmazonWebScraper.authenticated(cookies, "us") as amz:
+    ...
+```
+
+```
+[ 120.2s] signup                       GET  200 https://www.amazon.com/ap/register
+[ 198.4s] signup                       POST 200 https://www.amazon.com/ap/register
+                                       fields: …, customerName, encryptedPwd, metadata1, …
+[ 422.6s] signin                       POST 302 https://www.amazon.com/ap/signin
+                                       -> https://www.amazon.com/ap/maplanding
+                                       set-cookie: …, x-main, at-main, sess-at-main   <- auth cookies
+[ 424.0s] app registration (MAP)       POST 200 https://api.amazon.com/auth/register
+```
+
+```bash
+python -m scraper.cli login --marketplace us            # or --app
+python -m scraper.cli web-reviews --auth-cookies android/flows/login_cookies.json --asin B00G2XGC88
+```
+
+It needs the emulator up with the CA installed (`start_emulator.sh`, `install_ca.sh`;
+plus `start_frida.sh` for `--app`). Run `install_ca.sh` before launching the app,
+because a running app keeps the trust store it started with. What the capture
+revealed is in §1, Finding 8. The capture goes to `android/flows/`:
+`login.ndjson` (one line per request: phase, redirect, submitted field *names*,
+cookies set), `login_cookies.json` (the jar) and `login.mitm` (full flows). The
+addon ([`android/_login_capture.py`](android/_login_capture.py)) redacts what you
+typed (password, email/phone, OTP codes, names) before anything is written. Session
+tokens are kept, so treat these files like a logged-in browser profile. They are
+git-ignored. Stopping with Ctrl-C before you finish signing in still keeps the
+capture, which is how you record a sign-up on its own.
+
+Each review row has `id, rating, title, body, date, verified, helpful, variant,
+author, author_profile, author_avatar, images` (photo URLs at full size).
+
+Each review's `author_profile` can be passed to `profile()` for the reviewer's
+public profile; that works anonymously, no sign-in needed:
+
+```python
+with AmazonWebScraper.open("us") as amz:
+    p = amz.profile("amzn1.account.XXXXXXXXXXXXXXXXXXXXXXXXXX")   # or the profile URL
+    print(p["name"], p["avatar"], len(p["reviews"]))
+```
+
+```bash
+python -m scraper.cli web-profile --profile amzn1.account.XXXXXXXXXXXXXXXXXXXXXXXXXX
+```
+
+Scope note: only *your own* session is used for sign-in.
 
 Design points worth noting:
 - **Resilience.** Transient `429/503/5xx` and connection errors are retried with
@@ -379,6 +631,7 @@ rows = parse_search(open("some_search.html").read())
 
 ```bash
 python -m scraper.cli web-search --keyword "coffee mug" --pages 2 --format ndjson
+python -m scraper.cli web-search --keyword "coffee mug" --pages all -v      # follow to the last page
 python -m scraper.cli web-product --marketplace uk --asin B0D1VN9691
 ```
 
@@ -436,16 +689,16 @@ target rps | sent | 200 | 429 | ok rps | retries
 
 ## 4. Ethics & scope
 
-- **Anonymous, read-only.** Collection uses an anonymous guest session (minted or
-  captured) and reads public catalogue pages. No account is logged in; no private
-  or account data is touched. Full review *text*, which is login-gated, is left
-  alone (`AuthRequired`).
-- **No detection-evasion.** We pass the bot wall the legitimate way — by requesting
-  the pages that answer a plain client and keeping the session — and rate-limit
-  politely. We do **not** forge TLS/browser fingerprints, solve CAPTCHAs, or rotate
-  identities to hide scale.
-- **People.** Reviewer / feedback author names are recorded only as shown on the
-  entry; reviewer profiles are not crawled or compiled.
+- **Anonymous by default, read-only.** Collection uses an anonymous guest session
+  (minted or captured) and reads public catalogue pages. Login-gated data (full
+  review *text*) is read only with a session *you* signed into yourself, by hand,
+  in your own browser or on the emulator (`login_in_browser`). Without one it is
+  left alone (`AuthRequired`). No one else's account data is touched.
+- **Passing the bot wall.** The scraper requests the pages that answer a plain
+  client, keeps the session, and rate-limits politely.
+- **People.** Reviewer profiles hold personal data (name, photo, bio, review
+  history). Collect only what your purpose needs, rate-limit, and check the data
+  protection rules that apply to you (e.g. GDPR) before storing or combining it.
 - **Your responsibility.** Scraping may conflict with Amazon's Terms of Service and
   local law; prefer the official PA-API / SP-API where they cover your need, and
   respect each target's ToS and robots directives before collecting.
